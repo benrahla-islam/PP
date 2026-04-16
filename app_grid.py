@@ -86,14 +86,18 @@ def rescale_lcoh(
     new_discount:   float,
     new_lifetime:   int,
     new_solar_capex:float,
+    new_wind_capex: float,
     new_elec_capex: float,
+    new_bat_capex:  float,
     new_elec_eff:   float,
     new_grid_price: float,
     new_dzd_usd:    float,
     base_discount:  float = 0.08,
     base_lifetime:  int   = 25,
     base_solar_capex:float= 600.0,
+    base_wind_capex:float = 1100.0,
     base_elec_capex:float = 700.0,
+    base_bat_capex: float = 250.0,
     base_elec_eff:  float = 55.0,
     base_grid_price:float = 9.0,
     base_dzd_usd:   float = 134.5,
@@ -118,16 +122,18 @@ def rescale_lcoh(
 
     crf_ratio   = crf(new_discount, new_lifetime) / crf(base_discount, base_lifetime)
     solar_ratio = new_solar_capex / base_solar_capex
+    wind_ratio  = new_wind_capex / base_wind_capex
     elec_ratio  = (new_elec_capex * (new_elec_eff / base_elec_eff)) / base_elec_capex
+    bat_ratio   = new_bat_capex / base_bat_capex
     grid_ratio  = (new_grid_price / new_dzd_usd) / (base_grid_price / base_dzd_usd)
 
     # Reconstruct scaled costs per kg
     df["cost_solar_scaled"]  = df["cost_solar"]      * crf_ratio * solar_ratio
-    df["cost_wind_scaled"]   = df["cost_wind"]        * crf_ratio
+    df["cost_wind_scaled"]   = df["cost_wind"]       * crf_ratio * wind_ratio
     df["cost_elec_scaled"]   = df["cost_electrolyzer"]* crf_ratio * elec_ratio
-    df["cost_h2t_scaled"]    = df["cost_h2_storage"]  * crf_ratio
-    df["cost_bat_scaled"]    = df["cost_battery"]     * crf_ratio
-    df["cost_grid_scaled"]   = df["cost_grid"]        * grid_ratio
+    df["cost_h2t_scaled"]    = df["cost_h2_storage"] * crf_ratio
+    df["cost_bat_scaled"]    = df["cost_battery"]    * crf_ratio * bat_ratio
+    df["cost_grid_scaled"]   = df["cost_grid"]       * grid_ratio
 
     # Sum → new total cost → new LCOH
     df["total_scaled"] = (df["cost_solar_scaled"] + df["cost_wind_scaled"] +
@@ -192,7 +198,9 @@ with st.sidebar:
     # the proportional capital costs in the pre-calculated dataframe.
     st.markdown("<div class='section-title'>⚙️ Technology Costs</div>", unsafe_allow_html=True)
     solar_capex     = st.slider("Solar CAPEX (USD/kW)",     200, 1500, 600, 25)
+    wind_capex      = st.slider("Wind CAPEX (USD/kW)",      500, 2000, 1100, 50)
     elec_capex      = st.slider("Electrolyzer CAPEX (USD/kW)", 200, 2000, 700, 50)
+    bat_capex       = st.slider("Battery CAPEX (USD/kWh)",  100, 800, 250, 10)
     elec_efficiency = st.slider("Electrolyzer Efficiency (kWh/kg H₂)", 40.0, 80.0, 55.0, 1.0)
 
     st.markdown("---")
@@ -258,7 +266,9 @@ if "scaled_df" not in st.session_state or apply_btn:
             new_discount=discount_rate,
             new_lifetime=project_lifetime,
             new_solar_capex=solar_capex,
+            new_wind_capex=wind_capex,
             new_elec_capex=elec_capex,
+            new_bat_capex=bat_capex,
             new_elec_eff=elec_efficiency,
             new_grid_price=grid_price_dzd,
             new_dzd_usd=dzd_to_usd,
@@ -498,6 +508,37 @@ with tab3:
             yaxis=dict(title="LCOH (USD/kg)", gridcolor="#1e3050"),
         )
         st.plotly_chart(fig_flh, width="stretch")
+
+    # ----- NEW BREAKDOWN STACKED BAR CHART -----
+    st.markdown("#### LCOH Cost Breakdown Across Top 100 Regions")
+    top_cells = valid.nsmallest(100, "lcoh_scaled").copy()
+    top_cells["cell_label"] = top_cells["lat"].astype(str) + "N, " + top_cells["lon"].astype(str) + "E"
+    
+    fig_stack = go.Figure()
+    components = [
+        ("cost_solar_scaled", "Solar PV", "#f5a623"),
+        ("cost_wind_scaled", "Wind Power", "#00d4b8"),
+        ("cost_elec_scaled", "Electrolyzer", "#ff4d6d"),
+        ("cost_bat_scaled", "Battery Storage", "#5a7a9a"),
+        ("cost_h2t_scaled", "H2 Tank Storage", "#c8d8f0"),
+        ("cost_grid_scaled", "Grid Electricity", "#ffffff"),
+    ]
+    for col, name, color in components:
+        fig_stack.add_trace(go.Bar(
+            x=top_cells["cell_label"],
+            y=top_cells[col] / top_cells["h2_produced_kg"].replace(0, np.nan),
+            name=name,
+            marker_color=color,
+        ))
+    fig_stack.update_layout(
+        barmode="stack",
+        **PLOT_BG, height=450,
+        xaxis=dict(title="Top 100 Grid Cells (Cheapest to Most Expensive)", showticklabels=False),
+        yaxis=dict(title="LCOH Component (USD/kg H₂)", gridcolor="#1e3050"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig_stack, width="stretch")
+    # -------------------------------------------
 
     # Full data table
     # TABLE SECTION: This renders the interactive data grid containing the full compiled dataset.
