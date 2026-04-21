@@ -181,7 +181,7 @@ def build_network(
     net.add("StorageUnit", "Battery",
             bus="AC", carrier="battery",
             p_nom_extendable=True, p_nom_min=0.0,
-            capital_cost=bat_auc * 4.0, marginal_cost=0.0,
+            capital_cost=bat_auc, marginal_cost=0.0,
             efficiency_store=params.battery_efficiency ** 0.5,
             efficiency_dispatch=params.battery_efficiency ** 0.5,
             max_hours=4.0, cyclic_state_of_charge=True)
@@ -192,10 +192,19 @@ def build_network(
             capital_cost=elec_auc, marginal_cost=0.0,
             efficiency=elec_eff, p_min_pu=0.0)
 
+    # FIX 6: H2 Tank capital_cost units.
+    # h2_storage_capex is in USD/kWh_H2 (energy-based storage cost).
+    # PyPSA Store tracks energy in kWh, so capital_cost = USD/kWh/yr = h2t_auc.
+    # Old code was:  capital_cost=h2t_auc * LHV_H2
+    # That inflated cost by LHV_H2 (~33×) because it treated kWh cost as kg cost
+    # and then multiplied by kWh/kg again. Correct form has no LHV_H2 here.
+    #
+    # NOTE: If your h2_storage_capex in utils.py is in USD/kg_H2 (not USD/kWh),
+    # change this line to:  capital_cost=h2t_auc / LHV_H2
     net.add("Store", "H2 Tank",
             bus="H2",
             e_nom_extendable=True, e_nom_min=0.0,
-            capital_cost=h2t_auc / LHV_H2,
+            capital_cost=h2t_auc,          # FIX 6: was h2t_auc * LHV_H2
             marginal_cost=0.0, e_cyclic=True)
 
     net.add("Load", "H2 Demand",
@@ -257,10 +266,18 @@ def extract_results(
     c_solar = solar_cap  * auc(params.solar_capex,        params.solar_opex_pct,        params.solar_lifetime)
     c_wind  = wind_cap   * auc(params.wind_capex,         params.wind_opex_pct,         params.wind_lifetime)
     c_elec  = elec_cap   * auc(params.electrolyzer_capex, params.electrolyzer_opex_pct, params.electrolyzer_lifetime)
-    c_bat   = bat_cap_kwh * auc(params.battery_capex,     params.battery_opex_pct,      params.battery_lifetime)
+    c_bat   = bat_cap_kw * auc(params.battery_capex,      params.battery_opex_pct,      params.battery_lifetime)
     c_grid  = grid_kwh   * params.grid_price_dzd / params.dzd_to_usd
 
-    c_h2t = h2t_kg * auc(params.h2_storage_capex, params.h2_storage_opex_pct, params.h2_storage_lifetime)
+    # FIX 7: H2 Tank cost extraction.
+    # h2_storage_capex is in USD/kWh_H2 → annual cost = h2t_kwh * auc (USD/kWh/yr).
+    # Old code was:  h2t_kwh * auc(...) * LHV_H2
+    # That multiplied by LHV_H2 a second time, inflating the cost by ~33×.
+    #
+    # NOTE: If h2_storage_capex is in USD/kg_H2, use instead:
+    #   c_h2t = h2t_kg * auc(params.h2_storage_capex, ...)
+    c_h2t = h2t_kwh * auc(params.h2_storage_capex, params.h2_storage_opex_pct, params.h2_storage_lifetime)
+    #                                                                            FIX 7: removed * LHV_H2
 
     total   = c_solar + c_wind + c_elec + c_h2t + c_bat + c_grid
 
