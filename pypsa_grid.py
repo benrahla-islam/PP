@@ -115,7 +115,7 @@ def solve_all_cells(
 
         print(f"  [{done_so_far:3d}/{n_todo}] cell {cell_id} "
               f"(lat={row['lat']:.1f}, lon={row['lon']:.1f})  {eta_str}",
-              end="\r", flush=True)
+              end="\n", flush=True)
 
         try:
             # Pull CF arrays for this cell
@@ -135,7 +135,7 @@ def solve_all_cells(
             status = solve_network(net, solver_name=solver)
 
             if status == "optimal":
-                res = extract_results(net, params, solar_cf)
+                res = extract_results(net, params, wind_cf)
                 record = res.to_dict()
             else:
                 record = {"status": status, "lcoh_usd_per_kg": np.nan}

@@ -26,13 +26,14 @@ from __future__ import annotations
 import argparse
 import sys
 import textwrap
-import warnings                                  # ← FIX 1: add
-warnings.filterwarnings("ignore", category=FutureWarning)   # ← FIX 1: suppress atlite 'H' warning
+import warnings                                           # FIX 1a
+warnings.filterwarnings("ignore", category=FutureWarning) # FIX 1b: suppress atlite 'H' deprecation
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from shapely.geometry import Point, Polygon
+
 
 ROOT     = Path(__file__).parent
 DATA_DIR = ROOT / "data"
@@ -42,11 +43,13 @@ GRID_CELLS_PATH = DATA_DIR / "grid_cells.csv"
 ATLITE_NC       = DATA_DIR / "algeria_era5_cutout.nc"
 STATS_PATH      = DATA_DIR / "grid_cf_stats.csv"
 
+
 FILE_PAIRS = [
     ("era5_p1_accum.nc",  "era5_p1_instant.nc",  "Jan-Apr"),
     ("era5_p2_accum.nc",  "era5_p2_instant.nc",  "May-Aug"),
     ("era5_p3_accum.nc",  "era5_p3_instant.nc",  "Sep-Dec"),
 ]
+
 
 ALGERIA_BORDER = Polygon([
     (-1.79, 35.84), (-1.21, 35.60), (-0.63, 35.73), (0.00, 35.93),
@@ -126,6 +129,12 @@ def _drop_problem_dims(ds):
                drop it.
 
     Also drops other scalar extras that break concat alignment.
+
+    NOTE (FIX 2): This function ONLY handles dimension/coordinate cleanup.
+    Roughness and wind variable handling was incorrectly placed here before —
+    at this stage only accum OR instant vars exist (never both), so wnd100m
+    does not exist yet. All variable renaming lives in STAGE 7 of merge_era5_files,
+    after xr.merge([ds_accum, ds_instant]).
     """
     EXTRA_VARS = ("expver", "number", "realization", "surface")
 
@@ -142,24 +151,9 @@ def _drop_problem_dims(ds):
 
     for name in EXTRA_VARS:
         ds = ds.drop_vars(name, errors="ignore")
-        # ── FIX 2: Rename fsr → roughness (atlite log-law needs it) ──────────────
-    # Previously this was dropped — that killed logarithmic wind extrapolation.
-    if "fsr" in ds:
-        ds = ds.rename({"fsr": "roughness"})
-        ds["roughness"] = ds["roughness"].clip(min=1e-5)   # guard against 0
-    elif "roughness" not in ds:
-        # Fallback: constant roughness for desert/open terrain (~Algeria average)
-        # Fraunhofer convention: 2e-4 m when fsr absent [web:19]
-        print("  ⚠  roughness (fsr) missing — using constant 2e-4 m (open terrain fallback)")
-        import xarray as xr
-        ds["roughness"] = xr.DataArray(
-            np.full_like(ds["wnd100m"].values, 2e-4, dtype="float32"),
-            dims=ds["wnd100m"].dims,
-            coords=ds["wnd100m"].coords,
-            attrs={"long_name": "surface roughness length (constant)", "units": "m"},
-        )
+
     return ds
-    
+
 
 def _harmonise_grid(datasets: list, decimals: int = 4) -> list:
     """
@@ -249,6 +243,11 @@ def merge_era5_files(
         print(f"    {label} ...", end=" ", flush=True)
         ds_acc = xr.open_dataset(str(accum_path),   engine="netcdf4")
         ds_ins = xr.open_dataset(str(instant_path), engine="netcdf4")
+        # FIX 2: _drop_problem_dims is now coord/dim cleanup ONLY.
+        # No roughness or wind variable code belongs here — wnd100m
+        # doesn't exist yet at this point (accum files have ssrd/fdir,
+        # instant files have u100/v100/t2m). All variable renaming
+        # happens in STAGE 7 after the merge.
         ds_acc = _drop_problem_dims(ds_acc)
         ds_ins = _drop_problem_dims(ds_ins)
         accum_parts.append(ds_acc)
@@ -284,7 +283,7 @@ def merge_era5_files(
     # STAGE 6: Rename coordinates -> atlite convention (latitude->y, longitude->x)
     coord_rename = {}
     if "longitude" in ds.coords: coord_rename["longitude"] = "x"
-    if "latitude" in ds.coords: coord_rename["latitude"] = "y"
+    if "latitude"  in ds.coords: coord_rename["latitude"]  = "y"
     if coord_rename:
         ds = ds.rename(coord_rename)
 
@@ -294,6 +293,8 @@ def merge_era5_files(
     )
 
     # STAGE 7: Rename variables -> atlite internal names
+    # All variable renaming happens here — AFTER the accum+instant merge,
+    # so every variable (ssrd, fdir, u100, v100, t2m, fsr, etc.) is present.
     var_rename: dict[str, str] = {}
 
     if "tisr" in ds:
@@ -309,40 +310,65 @@ def merge_era5_files(
         var_rename["t2m"] = "temperature"
 
     ds = ds.rename({k: v for k, v in var_rename.items() if k in ds})
+
     if "influx_toa" not in ds and "influx_direct" in ds and "influx_diffuse" in ds:
         print("  ⚠  influx_toa missing — estimating from direct + diffuse (re-download tisr for accuracy)")
         ds["influx_toa"] = (ds["influx_direct"] + ds["influx_diffuse"]) * 1.20
         ds["influx_toa"] = ds["influx_toa"].clip(min=0.0)
 
+    # ── Build wnd100m from wind components ────────────────────────────────────
     if "u100" in ds and "v100" in ds:
         ds["wnd100m"] = np.sqrt(ds["u100"] ** 2 + ds["v100"] ** 2).astype("float32")
         ds = ds.drop_vars(["u100", "v100"])
     elif "u10" in ds and "v10" in ds:
         ds["wnd100m"] = np.sqrt(ds["u10"] ** 2 + ds["v10"] ** 2).astype("float32")
         ds = ds.drop_vars(["u10", "v10"])
-        print("  WARNING: 100 m wind not found - using 10 m wind as fallback")
+        print("  WARNING: 100 m wind not found — using 10 m wind as fallback")
     else:
-        print("  WARNING: no wind components found - wind CF will be unavailable")
-    if "albedo" not in ds and "outflux" not in ds:
-        import xarray as xr
+        print("  WARNING: no wind components found — wind CF will be unavailable")
+
+    # ── FIX 3: Build roughness from fsr (MUST be after wnd100m is built) ──────
+    # Previously this block was wrongly inside _drop_problem_dims, where it
+    # crashed because wnd100m (used as a shape template for the fallback) only
+    # exists after the accum+instant merge above.
+    #
+    # Priority order:
+    #   1. fsr in dataset  → rename to roughness (best: actual surface roughness)
+    #   2. roughness already named → skip
+    #   3. Neither present → constant 2e-4 m fallback (open desert terrain)
+    if "fsr" in ds:
+        ds = ds.rename({"fsr": "roughness"})
+        ds["roughness"] = ds["roughness"].clip(min=1e-5)
+        print("  ✓  roughness loaded from fsr")
+    elif "roughness" not in ds:
+        if "wnd100m" in ds:
+            print("  ⚠  roughness (fsr) missing — using constant 2e-4 m (open terrain fallback)")
+            ds["roughness"] = xr.DataArray(
+                np.full_like(ds["wnd100m"].values, 2e-4, dtype="float32"),
+                dims=ds["wnd100m"].dims,
+                coords=ds["wnd100m"].coords,
+                attrs={"long_name": "surface roughness length (constant)", "units": "m"},
+            )
+        else:
+            print("  WARNING: cannot create roughness fallback — wnd100m not found")
+
+    # ── Build albedo if missing ────────────────────────────────────────────────
+    if "albedo" not in ds and "influx_direct" in ds:
         print("  ⚠  albedo missing — using constant 0.28 (Sahara desert average)")
-        albedo_vals = np.full_like(
-            ds["influx_direct"].values, 0.28, dtype="float32"
-        )
         ds["albedo"] = xr.DataArray(
-            albedo_vals,
+            np.full_like(ds["influx_direct"].values, 0.28, dtype="float32"),
             dims=ds["influx_direct"].dims,
             coords=ds["influx_direct"].coords,
             attrs={"long_name": "surface albedo (constant approximation)", "units": "1"},
         )
 
-        # Drop fsr (forecast surface roughness) — not used by atlite, saves ~300 MB
-    ds = ds.drop_vars("fsr", errors="ignore")
     # STAGE 8: Set mandatory atlite metadata
-        # ── FIX 3: roughness must be listed so atlite marks 'wind' as prepared ───
+    # FIX 4: 'roughness' added to wind feature requirements so atlite
+    # marks 'wind' as a prepared feature. Without it, atlite silently
+    # skips wind even when wnd100m is present.
     FEATURE_MAP = {
         "influx":      ["influx_toa", "influx_direct", "influx_diffuse"],
-        "wind":        ["wnd100m", "roughness"],    # ← added roughness
+        "wind":        ["wnd100m", "roughness"],   # FIX 4: roughness required for log extrapolation
         "temperature": ["temperature"],
     }
     prepared = [
@@ -413,9 +439,15 @@ def extract_cf_for_grid(
         )
         solar_parts.append(cf_solar.values.ravel())
 
+        # FIX 5: Changed from "power" to "logarithmic".
+        # "power" law requires wnd_shear_exp, which atlite derives only when
+        # BOTH wnd10m and wnd100m are downloaded (needs u10/v10 + u100/v100).
+        # "logarithmic" law uses roughness (fsr), which we now keep in STAGE 7.
+        # To use power law in the future: add u10/v10 to your CDS download —
+        # atlite will then compute wnd_shear_exp automatically.
         cf_wind = cutout.wind(
             turbine=turbine,
-            interpolation_method="logarithmic",   # ← was "power"
+            interpolation_method="logarithmic",  # FIX 5: was "power"
             layout=layout_pt,
             per_unit=True,
         )
@@ -537,3 +569,4 @@ if __name__ == "__main__":
     parser.add_argument("--force",      action="store_true")
     args = parser.parse_args()
     run(year=args.year, resolution=args.resolution, force=args.force)
+    
