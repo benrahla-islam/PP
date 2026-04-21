@@ -1,571 +1,515 @@
 """
-atlite_grid.py — Merge manually downloaded ERA5 files and extract
-                 solar/wind capacity factors for every 2 degree grid cell in Algeria by default.
-
-Your data/ folder should contain:
-    era5_p1_accum.nc      <- Jan-Apr  solar radiation (accumulated variables)
-    era5_p1_instant.nc    <- Jan-Apr  wind + temperature (instantaneous variables)
-    era5_p2_accum.nc      <- May-Aug  solar radiation
-    era5_p2_instant.nc    <- May-Aug  wind + temperature
-    era5_p3_accum.nc      <- Sep-Dec  solar radiation
-    era5_p3_instant.nc    <- Sep-Dec  wind + temperature
-
-Usage:
-    python atlite_grid.py
-    python atlite_grid.py --year 2024
-    python atlite_grid.py --force    # rebuild cutout even if cache exists
-
-Output:
-    data/grid_cells.csv          - cell coordinates
-    data/solar_cf_grid.csv       - hourly solar CF  (8760 x n_cells)
-    data/wind_cf_grid.csv        - hourly wind CF   (8760 x n_cells)
-    data/grid_cf_stats.csv       - annual stats per cell
+app_grid.py — Algeria Green Hydrogen LCOH Grid Map
+Run: streamlit run app_grid.py
 """
 
-from __future__ import annotations
-import argparse
-import sys
-import textwrap
-import warnings                                           # FIX 1a
-warnings.filterwarnings("ignore", category=FutureWarning) # FIX 1b: suppress atlite 'H' deprecation
-from pathlib import Path
-
+import warnings
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point, Polygon
+import plotly.graph_objects as go
+import streamlit as st
+
+warnings.filterwarnings("ignore")
+
+st.set_page_config(
+    page_title="Algeria H₂ LCOH Map",
+    page_icon="🇩🇿",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+# ── CSS ───────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap');
+:root {
+    --bg:#070d1a; 
+    --bg2:#0d1829; 
+    --bg3:#111f35;
+    --border:#1e3050; 
+    --amber:#f5a623; 
+    --amber2:#ffd07a;
+    --teal:#00d4b8; 
+    --red:#ff4d6d;
+    --text:#c8d8f0;
+    --muted:#5a7a9a; 
+    --white:#eaf2ff;
+}
+html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;color:var(--text)!important;font-family:'Syne',sans-serif;}
+[data-testid="stSidebar"]{background:var(--bg2)!important;border-right:1px solid var(--border);}
+[data-testid="stSidebar"] *{color:var(--text)!important;}
+h1,h2,h3{font-family:'Syne',sans-serif!important;color:var(--white)!important;}
+[data-testid="metric-container"]{background:var(--bg3)!important;border:1px solid var(--border)!important;border-radius:8px!important;padding:12px 16px!important;}
+[data-testid="metric-container"] label{color:var(--muted)!important;font-size:11px!important;letter-spacing:.08em;text-transform:uppercase;}
+[data-testid="metric-container"] [data-testid="stMetricValue"]{color:var(--amber)!important;font-family:'Space Mono',monospace!important;font-size:1.5rem!important;}
+.stButton>button{background:linear-gradient(135deg,var(--amber),#e08800)!important;color:#070d1a!important;font-family:'Space Mono',monospace!important;font-weight:700!important;border:none!important;border-radius:6px!important;padding:10px 24px!important;width:100%;}
+[data-testid="stSelectbox"]>div>div{background:var(--bg3)!important;border:1px solid var(--border)!important;color:var(--white)!important;border-radius:6px!important;}
+[data-testid="stTabs"] button{font-family:'Space Mono',monospace!important;font-size:12px!important;color:var(--muted)!important;letter-spacing:.06em;}
+[data-testid="stTabs"] button[aria-selected="true"]{color:var(--amber)!important;border-bottom:2px solid var(--amber)!important;}
+.info-box{background:var(--bg3);border-left:3px solid var(--amber);border-radius:0 8px 8px 0;padding:12px 16px;margin:8px 0;font-size:13px;}
+.warn-box{background:#1a0d0d;border-left:3px solid var(--red);border-radius:0 8px 8px 0;padding:12px 16px;margin:8px 0;font-size:13px;color:#ffaaaa;}
+.section-title{font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.15em;color:var(--muted);text-transform:uppercase;border-bottom:1px solid var(--border);padding-bottom:6px;margin:20px 0 12px 0;}
+.stat-card{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:16px;text-align:center;}
+.stat-card .val{font-family:'Space Mono',monospace;font-size:1.4rem;color:var(--amber);}
+.stat-card .lbl{font-size:11px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-top:4px;}
+#MainMenu { visibility: hidden; }
+footer { visibility: hidden; [data-testid="collapsedControl"] {
+    background: #f5a623 !important;
+    border-radius: 50% !important;
+    width: 40px !important;
+    height: 40px !important;
+    top: 10px !important;
+    color: #070d1a !important;
+}
+
+[data-testid="collapsedControl"]:hover {
+    background: #ffd07a !important;
+    transform: scale(1.1);
+    transition: all 0.2s ease;
+}
+.block-container{padding-top:1.5rem!important;}
+</style>
+""", unsafe_allow_html=True)
+
+PLOT_BG = dict(
+    paper_bgcolor="#0d1829", plot_bgcolor="#070d1a",
+    font=dict(family="Space Mono, monospace", color="#c8d8f0", size=11),
+    margin=dict(l=10, r=10, t=40, b=10),
+)
+
+DATA_DIR   = __import__("pathlib").Path(__file__).parent / "data"
+GRID_PATH  = DATA_DIR / "lcoh_grid.csv"
+STATS_PATH = DATA_DIR / "grid_cf_stats.csv"
 
 
-ROOT     = Path(__file__).parent
-DATA_DIR = ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-GRID_CELLS_PATH = DATA_DIR / "grid_cells.csv"
-ATLITE_NC       = DATA_DIR / "algeria_era5_cutout.nc"
-STATS_PATH      = DATA_DIR / "grid_cf_stats.csv"
-
-
-FILE_PAIRS = [
-    ("era5_p1_accum.nc",  "era5_p1_instant.nc",  "Jan-Apr"),
-    ("era5_p2_accum.nc",  "era5_p2_instant.nc",  "May-Aug"),
-    ("era5_p3_accum.nc",  "era5_p3_instant.nc",  "Sep-Dec"),
-]
-
-
-ALGERIA_BORDER = Polygon([
-    (-1.79, 35.84), (-1.21, 35.60), (-0.63, 35.73), (0.00, 35.93),
-    (0.57,  36.07), (1.33,  36.17), (2.45,  36.59), (3.06,  36.74),
-    (3.48,  36.76), (4.05,  36.72), (4.76,  36.07), (5.08,  36.75),
-    (5.41,  36.19), (5.77,  36.82), (6.26,  36.45), (6.61,  36.37),
-    (7.43,  36.46), (7.77,  36.90), (8.12,  35.40),
-    (8.57,  34.50), (9.05,  33.50), (9.52,  30.23),
-    (9.84,  26.50), (9.94,  24.00), (9.36,  23.00),
-    (8.57,  21.50), (5.83,  19.45),
-    (4.23,  19.14), (3.12,  19.14), (1.16,  20.73),
-    (0.16,  14.99),
-    (-4.82, 14.99), (-5.40, 15.49), (-5.65, 16.57),
-    (-8.67, 27.66), (-8.67, 28.70),
-    (-8.00, 32.50), (-6.36, 34.01), (-4.35, 35.17),
-    (-3.16, 35.24), (-1.79, 35.84),
-])
-
-
-# =============================================================================
-# 1. Grid cells
-# =============================================================================
-def build_grid_cells(resolution: float = 1.0) -> pd.DataFrame:
-    lons = np.arange(-8.5, 10.5 + resolution, resolution)
-    lats = np.arange(19.5, 37.5 + resolution, resolution)
-    cells = []
-    for lat in lats:
-        for lon in lons:
-            if ALGERIA_BORDER.contains(Point(lon, lat)):
-                cells.append({
-                    "cell_id": f"{lat:.1f}_{lon:.1f}",
-                    "lat":     round(float(lat), 1),
-                    "lon":     round(float(lon), 1),
-                })
-    df = pd.DataFrame(cells)
-    print(f"+ {len(df)} grid cells inside Algeria at {resolution} resolution")
+def ensure_cell_id(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "cell_id" not in df.columns:
+        df["cell_id"] = df["lat"].round(4).astype(str) + "_" + df["lon"].round(4).astype(str)
+    df["cell_id"] = df["cell_id"].astype(str)
     return df
 
 
-# =============================================================================
-# 2. Check input files
-# =============================================================================
-def check_input_files() -> list[tuple[Path, Path, str]]:
-    missing = []
-    pairs   = []
-    for accum_name, instant_name, label in FILE_PAIRS:
-        accum_path   = DATA_DIR / accum_name
-        instant_path = DATA_DIR / instant_name
-        if not accum_path.exists():   missing.append(str(accum_path))
-        if not instant_path.exists(): missing.append(str(instant_path))
-        pairs.append((accum_path, instant_path, label))
-
-    if missing:
-        print("\n  Missing input files:")
-        for f in missing:
-            print(f"   {f}")
-        sys.exit(1)
-
-    print("+ All 6 ERA5 input files found")
-    return pairs
+def detect_resolution(df: pd.DataFrame) -> float:
+    lons = np.sort(df["lon"].unique())
+    return float(np.round(np.median(np.diff(lons)), 4)) if len(lons) > 1 else 1.0
 
 
-# =============================================================================
-# 3. Merge helpers
-# =============================================================================
-def _drop_problem_dims(ds):
-    """
-    Handle 'valid_time' correctly depending on what it is in the file:
+def make_complete_grid(df: pd.DataFrame, resolution: float) -> pd.DataFrame:
+    """All (lat,lon) points in the bounding box — NaN for cells not in df."""
+    half = resolution / 2.0
+    lats = np.round(np.arange(
+        np.floor(df["lat"].min() / resolution) * resolution,
+        np.ceil (df["lat"].max() / resolution) * resolution + half,
+        resolution), 6)
+    lons = np.round(np.arange(
+        np.floor(df["lon"].min() / resolution) * resolution,
+        np.ceil (df["lon"].max() / resolution) * resolution + half,
+        resolution), 6)
 
-      Case A — valid_time is the ONLY time dimension (your files):
-               rename it to 'time' so xr.concat(dim='time') works.
+    full = pd.DataFrame(
+        [(round(float(la), 4), round(float(lo), 4)) for la in lats for lo in lons],
+        columns=["lat", "lon"],
+    )
+    full["cell_id"] = full["lat"].astype(str) + "_" + full["lon"].astype(str)
 
-      Case B — valid_time is a secondary dimension alongside 'time':
-               drop it entirely (it's redundant).
-
-      Case C — valid_time is just a plain coordinate:
-               drop it.
-
-    Also drops other scalar extras that break concat alignment.
-
-    NOTE (FIX 2): This function ONLY handles dimension/coordinate cleanup.
-    Roughness and wind variable handling was incorrectly placed here before —
-    at this stage only accum OR instant vars exist (never both), so wnd100m
-    does not exist yet. All variable renaming lives in STAGE 7 of merge_era5_files,
-    after xr.merge([ds_accum, ds_instant]).
-    """
-    EXTRA_VARS = ("expver", "number", "realization", "surface")
-
-    if "valid_time" in ds.dims:
-        if "time" not in ds.dims:
-            # Case A: valid_time IS the time axis — just rename it
-            ds = ds.rename({"valid_time": "time"})
-        else:
-            # Case B: redundant secondary dimension alongside time
-            ds = ds.drop_dims("valid_time")
-    elif "valid_time" in ds.coords:
-        # Case C: plain auxiliary coordinate
-        ds = ds.drop_vars("valid_time")
-
-    for name in EXTRA_VARS:
-        ds = ds.drop_vars(name, errors="ignore")
-
-    return ds
+    df2 = df.copy()
+    df2["lat"] = df2["lat"].round(4)
+    df2["lon"] = df2["lon"].round(4)
+    merged = full.merge(df2, on=["lat", "lon"], how="left", suffixes=("", "_d"))
+    if "cell_id_d" in merged.columns:
+        merged.drop(columns=["cell_id_d"], inplace=True)
+    return merged
 
 
-def _harmonise_grid(datasets: list, decimals: int = 4) -> list:
-    """
-    Reindex every dataset onto the first dataset's lat/lon grid.
-    Fixes AlignmentError when three separate CDS jobs return grids
-    that differ by one cell (e.g. 225 vs 224 latitude points).
-    """
-    if len(datasets) <= 1:
-        return datasets
-
-    ref      = datasets[0]
-    lat_name = next((c for c in ("latitude", "lat", "y") if c in ref.coords), None)
-    lon_name = next((c for c in ("longitude", "lon", "x") if c in ref.coords), None)
-
-    if lat_name is None or lon_name is None:
-        print("  WARNING: cannot detect lat/lon coord names - skipping harmonise")
-        return datasets
-
-    ref_lat = np.round(ref[lat_name].values, decimals)
-    ref_lon = np.round(ref[lon_name].values, decimals)
-
-    out = []
-    for i, ds in enumerate(datasets):
-        ds = ds.assign_coords({
-            lat_name: np.round(ds[lat_name].values, decimals),
-            lon_name: np.round(ds[lon_name].values, decimals),
+@st.cache_data
+def build_geojson(lats, lons, cell_ids, resolution: float) -> dict:
+    """One exact-size GeoJSON polygon per cell — neighbours share edges."""
+    half = resolution / 2.0
+    features = []
+    for lat, lon, cid in zip(lats, lons, cell_ids):
+        features.append({
+            "type": "Feature",
+            "id": str(cid),
+            "properties": {},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [lon - half, lat - half],
+                    [lon + half, lat - half],
+                    [lon + half, lat + half],
+                    [lon - half, lat + half],
+                    [lon - half, lat - half],
+                ]],
+            },
         })
-        ds = ds.reindex(
-            {lat_name: ref_lat, lon_name: ref_lon},
-            method="nearest",
-            tolerance=0.5,
-        )
-        out.append(ds)
-        print(f"    Part {i + 1}: {len(ref_lat)} lat x {len(ref_lon)} lon")
-
-    return out
+    return {"type": "FeatureCollection", "features": features}
 
 
-def _deaccumulate(ds, variables: list[str]):
-    """
-    Convert ERA5 accumulated fields (J/m2) to mean power (W/m2).
-    Accumulations reset at 00:00 UTC each day; differencing consecutive
-    hourly values gives per-hour energy, then divide by 3600 s.
-    """
-    ds_out = ds.copy(deep=True)
-    for var in variables:
-        if var not in ds_out:
-            continue
-        data  = ds_out[var].values.copy()
-        deacc = np.zeros_like(data)
-        deacc[0] = data[0]
-        for t in range(1, data.shape[0]):
-            diff     = data[t] - data[t - 1]
-            deacc[t] = np.where(diff >= 0, diff, data[t])
-        ds_out[var].values[:] = np.clip(deacc / 3600.0, 0, None)
-    return ds_out
+# ── Data loading ──────────────────────────────────────────────────────────────
+
+@st.cache_data
+def load_grid() -> pd.DataFrame:
+    if not GRID_PATH.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(GRID_PATH)
+    df = df[df["lcoh_usd_per_kg"].notna() & (df["lcoh_usd_per_kg"] < 50)]
+    return ensure_cell_id(df)
 
 
-# =============================================================================
-# 4. Main merge function
-# =============================================================================
-def merge_era5_files(
-    pairs: list[tuple[Path, Path, str]],
-    year:  int,
-    force: bool = False,
-):
-    """
-    Load 6 raw ERA5 NetCDF files, merge them into one atlite-compatible
-    cutout file, and return the atlite.Cutout object.
-    """
-    import json
-    import atlite
-    import xarray as xr
+@st.cache_data
+def load_stats() -> pd.DataFrame:
+    if not STATS_PATH.exists():
+        return pd.DataFrame()
+    return ensure_cell_id(pd.read_csv(STATS_PATH, index_col=0))
 
-    # Fast path: reuse a previously built cutout
-    if ATLITE_NC.exists() and not force:
-        print(f"  Loading cached cutout: {ATLITE_NC.name}")
-        cutout = atlite.Cutout(path=str(ATLITE_NC))
-        print(f"+ Cutout loaded - {len(cutout.coords['time'])} time steps")
-        return cutout
 
-    # STAGE 1: Load raw files
-    print("  Loading ERA5 part files ...")
-    accum_parts, instant_parts = [], []
+# ── Financial rescaling ───────────────────────────────────────────────────────
 
-    for accum_path, instant_path, label in pairs:
-        print(f"    {label} ...", end=" ", flush=True)
-        ds_acc = xr.open_dataset(str(accum_path),   engine="netcdf4")
-        ds_ins = xr.open_dataset(str(instant_path), engine="netcdf4")
-        # FIX 2: _drop_problem_dims is now coord/dim cleanup ONLY.
-        # No roughness or wind variable code belongs here — wnd100m
-        # doesn't exist yet at this point (accum files have ssrd/fdir,
-        # instant files have u100/v100/t2m). All variable renaming
-        # happens in STAGE 7 after the merge.
-        ds_acc = _drop_problem_dims(ds_acc)
-        ds_ins = _drop_problem_dims(ds_ins)
-        accum_parts.append(ds_acc)
-        instant_parts.append(ds_ins)
-        print("ok")
+def rescale_lcoh(base_df, new_discount, new_lifetime, new_solar_capex,
+                 new_elec_capex, new_elec_eff, new_grid_price, new_dzd_usd,
+                 base_discount=0.08, base_lifetime=25, base_solar_capex=600.0,
+                 base_elec_capex=700.0, base_elec_eff=55.0,
+                 base_grid_price=9.0,  base_dzd_usd=134.5) -> pd.DataFrame:
+    df = base_df.copy()
 
-    # STAGE 2: Harmonise grids (fixes size-mismatch AlignmentError)
-    print("  Harmonising spatial grids ...")
-    print("  accum:")
-    accum_parts   = _harmonise_grid(accum_parts)
-    print("  instant:")
-    instant_parts = _harmonise_grid(instant_parts)
+    def crf(r, n):
+        return (1/n) if r == 0 else r*(1+r)**n / ((1+r)**n - 1)
 
-    # STAGE 3: Concatenate along time
-    print("  Concatenating along time ...")
-    ds_accum   = xr.concat(accum_parts,   dim="time").sortby("time")
-    ds_instant = xr.concat(instant_parts, dim="time").sortby("time")
+    crf_r   = crf(new_discount, new_lifetime) / crf(base_discount, base_lifetime)
+    sol_r   = new_solar_capex / base_solar_capex
+    elec_r  = (new_elec_capex * (new_elec_eff / base_elec_eff)) / base_elec_capex
+    grid_r  = (new_grid_price / new_dzd_usd) / (base_grid_price / base_dzd_usd)
 
-    # STAGE 4: Deaccumulate radiation (J/m2 -> W/m2)
-    accum_vars = [
-        v for v in ds_accum.data_vars
-        if any(k in v for k in ("ssrd", "fdir", "tisr", "ssr", "str"))
-    ]
-    if accum_vars:
-        print(f"  De-accumulating: {accum_vars}")
-        ds_accum = _deaccumulate(ds_accum, accum_vars)
+    df["cost_solar_scaled"]  = df["cost_solar"]       * crf_r * sol_r
+    df["cost_wind_scaled"]   = df["cost_wind"]         * crf_r
+    df["cost_elec_scaled"]   = df["cost_electrolyzer"] * crf_r * elec_r
+    df["cost_h2t_scaled"]    = df["cost_h2_storage"]   * crf_r
+    df["cost_bat_scaled"]    = df["cost_battery"]      * crf_r
+    df["cost_grid_scaled"]   = df["cost_grid"]         * grid_r
+
+    df["total_scaled"]    = (df["cost_solar_scaled"] + df["cost_wind_scaled"] +
+                             df["cost_elec_scaled"]  + df["cost_h2t_scaled"]  +
+                             df["cost_bat_scaled"]   + df["cost_grid_scaled"])
+    h2_kg = df["h2_produced_kg"].replace(0, np.nan)
+    df["lcoh_scaled"]     = df["total_scaled"] / h2_kg
+    df["lcoh_dzd_scaled"] = df["lcoh_scaled"] * new_dzd_usd
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("## 🇩🇿 H₂ LCOH Grid Map")
+    st.markdown("<div style='color:#5a7a9a;font-size:12px;margin-bottom:16px'>Algeria — Research Tool</div>",
+                unsafe_allow_html=True)
+
+    grid_df  = load_grid()
+    stats_df = load_stats()
+    has_data = len(grid_df) > 0
+
+    if has_data:
+        st.markdown(f"<div class='info-box'>✅ Grid loaded — <b>{len(grid_df)} cells</b></div>",
+                    unsafe_allow_html=True)
     else:
-        print("  WARNING: no accumulated radiation variables found - skipping")
+        st.markdown("""<div class='warn-box'>⚠️ No grid found.<br>
+            Run: <code>python atlite_grid.py</code><br>
+            Then: <code>python pypsa_grid.py</code></div>""", unsafe_allow_html=True)
 
-    # STAGE 5: Merge accum + instant
-    ds = xr.merge([ds_accum, ds_instant], join="override")
+    st.markdown("<div class='section-title'>🗺️ Map Display</div>", unsafe_allow_html=True)
+    map_metric = st.selectbox("Color cells by", [
+        "LCOH (USD/kg H₂)", "LCOH (DZD/kg H₂)", "Solar Full Load Hours",
+        "Wind CF Mean", "Renewable Share (%)",
+        "Electrolyzer Utilization (%)", "Solar Capacity (kW)",
+    ])
+    colorscale = st.selectbox("Color scale",
+        ["RdYlGn_r", "Viridis", "Plasma", "Turbo", "RdBu_r", "YlOrRd"], index=0)
 
-    # STAGE 6: Rename coordinates -> atlite convention (latitude->y, longitude->x)
-    coord_rename = {}
-    if "longitude" in ds.coords: coord_rename["longitude"] = "x"
-    if "latitude"  in ds.coords: coord_rename["latitude"]  = "y"
-    if coord_rename:
-        ds = ds.rename(coord_rename)
+    # ── Opacity slider so user can tune how much map shows through ────────────
+    cell_opacity = st.slider("Cell opacity (lower = see map through)", 0.2, 1.0, 0.55, 0.05)
 
-    ds = ds.assign_coords(
-        lon=ds["x"],
-        lat=ds["y"],
+    st.markdown("<div class='section-title'>💰 Financials</div>", unsafe_allow_html=True)
+    discount_rate    = st.slider("Discount Rate / WACC (%)", 3, 20, 8) / 100
+    project_lifetime = st.slider("Project Lifetime (yr)", 10, 30, 25)
+    grid_price_dzd   = st.slider("Grid Price (DZD/kWh)", 3.0, 25.0, 9.0, 0.5)
+    dzd_to_usd       = st.number_input("DZD / USD", value=134.5, step=1.0)
+
+    st.markdown("<div class='section-title'>⚙️ Technology Costs</div>", unsafe_allow_html=True)
+    solar_capex     = st.slider("Solar CAPEX (USD/kW)",             200,  1500, 600,  25)
+    elec_capex      = st.slider("Electrolyzer CAPEX (USD/kW)",      200,  2000, 700,  50)
+    elec_efficiency = st.slider("Electrolyzer Efficiency (kWh/kg)", 40.0, 80.0, 55.0, 1.0)
+
+    st.markdown("---")
+    apply_btn = st.button("🔄 APPLY TO MAP", use_container_width=True)
+
+    st.markdown("<div class='section-title'>📥 Export</div>", unsafe_allow_html=True)
+    if has_data:
+        st.download_button("⬇️ Download CSV", data=grid_df.to_csv(index=False),
+                           file_name="algeria_lcoh_grid.csv", mime="text/csv",
+                           use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HEADER
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("# 🇩🇿 Algeria — Green Hydrogen LCOH Grid Map")
+st.markdown("<p style='color:#5a7a9a;margin-top:-12px;font-size:14px'>"
+            "Spatial Levelized Cost of Hydrogen · ERA5 Weather · PyPSA Optimization</p>",
+            unsafe_allow_html=True)
+
+if not has_data:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("""<div class='info-box'><b>Step 1 — CDS API Key</b><br><br>
+        Register at <a href='https://cds.climate.copernicus.eu' target='_blank'>cds.climate.copernicus.eu</a>
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown("""<div class='info-box'><b>Step 2 — Download ERA5</b><br><br>
+        <code>python atlite_grid.py</code><br>~2–4 GB, once only.</div>""", unsafe_allow_html=True)
+    with c3:
+        st.markdown("""<div class='info-box'><b>Step 3 — Compute LCOH</b><br><br>
+        <code>python pypsa_grid.py</code><br>~9 min, once only.</div>""", unsafe_allow_html=True)
+    st.info("Refresh after running both scripts.")
+    st.stop()
+
+
+# ── Rescale ───────────────────────────────────────────────────────────────────
+if "scaled_df" not in st.session_state or apply_btn:
+    with st.spinner("Rescaling LCOH..."):
+        st.session_state.scaled_df = rescale_lcoh(
+            grid_df, discount_rate, project_lifetime, solar_capex,
+            elec_capex, elec_efficiency, grid_price_dzd, dzd_to_usd,
+        )
+
+scaled_df = st.session_state.scaled_df
+valid = scaled_df[scaled_df["lcoh_scaled"].notna() & (scaled_df["lcoh_scaled"] < 50)]
+
+# ── KPIs ──────────────────────────────────────────────────────────────────────
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("🏆 Min LCOH",   f"${valid['lcoh_scaled'].min():.2f}/kg")
+m2.metric("📊 Mean LCOH",  f"${valid['lcoh_scaled'].mean():.2f}/kg")
+m3.metric("📈 Max LCOH",   f"${valid['lcoh_scaled'].max():.2f}/kg")
+m4.metric("🔢 Grid Cells", f"{len(valid)}")
+m5.metric("♻️ Max Renew.", f"{valid['pct_renewable'].max():.0f}%")
+st.markdown("---")
+
+tab1, tab2, tab3 = st.tabs(["🗺️ LCOH MAP", "☀️ SOLAR RESOURCE", "📊 STATISTICS"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GRID MAP BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_grid_map(df_data: pd.DataFrame, col_name: str, col_label: str,
+                  cs: str, title: str, opacity: float = 0.55,
+                  height: int = 640) -> go.Figure:
+    """
+    Two-layer seamless grid map:
+
+      Layer 1 — ALL cells in bounding box, transparent with just a border line.
+                 Shows the Algeria map underneath (terrain, borders, city names).
+
+      Layer 2 — Only cells WITH data, semi-transparent colored fill.
+                 The map is still visible through the cells.
+    """
+    resolution = detect_resolution(df_data)
+
+    # Complete bounding box grid (for layer 1 outlines)
+    full_grid = make_complete_grid(df_data, resolution)
+    geo_bg = build_geojson(
+        tuple(full_grid["lat"].round(4)),
+        tuple(full_grid["lon"].round(4)),
+        tuple(full_grid["cell_id"]),
+        resolution,
     )
 
-    # STAGE 7: Rename variables -> atlite internal names
-    # All variable renaming happens here — AFTER the accum+instant merge,
-    # so every variable (ssrd, fdir, u100, v100, t2m, fsr, etc.) is present.
-    var_rename: dict[str, str] = {}
+    # Only cells with real values (for layer 2 colored fill)
+    df_plot = df_data[df_data[col_name].notna()].copy()
+    df_plot["cell_id"] = df_plot["cell_id"].astype(str)
+    geo_data = build_geojson(
+        tuple(df_plot["lat"].round(4)),
+        tuple(df_plot["lon"].round(4)),
+        tuple(df_plot["cell_id"]),
+        resolution,
+    )
 
-    if "tisr" in ds:
-        var_rename["tisr"] = "influx_toa"
-    if "fdir" in ds:
-        var_rename["fdir"] = "influx_direct"
-    if "ssrd" in ds and "fdir" in ds:
-        ds["influx_diffuse"] = (ds["ssrd"] - ds["fdir"]).clip(min=0.0)
-        ds = ds.drop_vars("ssrd")
-    elif "ssrd" in ds:
-        var_rename["ssrd"] = "influx_diffuse"
-    if "t2m" in ds:
-        var_rename["t2m"] = "temperature"
+    flh   = df_plot.get("solar_full_load_hours", pd.Series(0, index=df_plot.index))
+    renew = df_plot.get("pct_renewable",         pd.Series(0, index=df_plot.index))
+    hover = (
+        "<b>Cell " + df_plot["cell_id"] + "</b><br>"
+        + "📍 " + df_plot["lat"].round(2).astype(str) + "°N, "
+        + df_plot["lon"].round(2).astype(str) + "°E<br>"
+        + col_label + ": <b>" + df_plot[col_name].round(3).astype(str) + "</b><br>"
+        + "Solar FLH: " + flh.round(0).astype(str) + " h/yr<br>"
+        + "Renew: " + renew.round(1).astype(str) + "%"
+    )
 
-    ds = ds.rename({k: v for k, v in var_rename.items() if k in ds})
+    fig = go.Figure()
 
-    if "influx_toa" not in ds and "influx_direct" in ds and "influx_diffuse" in ds:
-        print("  ⚠  influx_toa missing — estimating from direct + diffuse (re-download tisr for accuracy)")
-        ds["influx_toa"] = (ds["influx_direct"] + ds["influx_diffuse"]) * 1.20
-        ds["influx_toa"] = ds["influx_toa"].clip(min=0.0)
+    # ── Layer 1: transparent grid outline (shows map underneath) ─────────────
+    fig.add_trace(go.Choroplethmapbox(
+        geojson=geo_bg,
+        locations=full_grid["cell_id"],
+        z=[0] * len(full_grid),
+        colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0)"]],  # fully transparent fill
+        showscale=False,
+        marker_opacity=1.0,           # opacity applies to fill; fill is transparent anyway
+        marker_line_width=0.8,        # visible grid border lines
+        marker_line_color="#2a4060",  # subtle blue-grey border — draws the grid
+        hoverinfo="skip",
+        name="",
+    ))
 
-    # ── Build wnd100m from wind components ────────────────────────────────────
-    if "u100" in ds and "v100" in ds:
-        ds["wnd100m"] = np.sqrt(ds["u100"] ** 2 + ds["v100"] ** 2).astype("float32")
-        ds = ds.drop_vars(["u100", "v100"])
-    elif "u10" in ds and "v10" in ds:
-        ds["wnd100m"] = np.sqrt(ds["u10"] ** 2 + ds["v10"] ** 2).astype("float32")
-        ds = ds.drop_vars(["u10", "v10"])
-        print("  WARNING: 100 m wind not found — using 10 m wind as fallback")
-    else:
-        print("  WARNING: no wind components found — wind CF will be unavailable")
+    # ── Layer 2: semi-transparent colored data cells ──────────────────────────
+    fig.add_trace(go.Choroplethmapbox(
+        geojson=geo_data,
+        locations=df_plot["cell_id"],
+        z=df_plot[col_name],
+        colorscale=cs,
+        zmin=float(df_plot[col_name].min()),
+        zmax=float(df_plot[col_name].max()),
+        marker_opacity=opacity,       # user-controlled — map visible through cells
+        marker_line_width=0.8,
+        marker_line_color="#2a4060",
+        colorbar=dict(
+            title=dict(text=col_label, font=dict(color="#c8d8f0", size=11)),
+            tickfont=dict(color="#c8d8f0"),
+            bgcolor="#0d1829", bordercolor="#1e3050", thickness=14,
+        ),
+        text=hover,
+        hoverinfo="text",
+        name=col_label,
+    ))
 
-    # ── FIX 3: Build roughness from fsr (MUST be after wnd100m is built) ──────
-    # Previously this block was wrongly inside _drop_problem_dims, where it
-    # crashed because wnd100m (used as a shape template for the fallback) only
-    # exists after the accum+instant merge above.
-    #
-    # Priority order:
-    #   1. fsr in dataset  → rename to roughness (best: actual surface roughness)
-    #   2. roughness already named → skip
-    #   3. Neither present → constant 2e-4 m fallback (open desert terrain)
-    if "fsr" in ds:
-        ds = ds.rename({"fsr": "roughness"})
-        ds["roughness"] = ds["roughness"].clip(min=1e-5)
-        print("  ✓  roughness loaded from fsr")
-    elif "roughness" not in ds:
-        if "wnd100m" in ds:
-            print("  ⚠  roughness (fsr) missing — using constant 2e-4 m (open terrain fallback)")
-            ds["roughness"] = xr.DataArray(
-                np.full_like(ds["wnd100m"].values, 2e-4, dtype="float32"),
-                dims=ds["wnd100m"].dims,
-                coords=ds["wnd100m"].coords,
-                attrs={"long_name": "surface roughness length (constant)", "units": "m"},
-            )
-        else:
-            print("  WARNING: cannot create roughness fallback — wnd100m not found")
+    fig.update_layout(
+        **PLOT_BG,
+        mapbox=dict(
+            style="carto-darkmatter",
+            center=dict(lat=28.0, lon=2.5),
+            zoom=4.2,
+        ),
+        height=height,
+        showlegend=False,
+        title=dict(
+            text=title,
+            font=dict(color="#f5a623", size=14, family="Space Mono"),
+            x=0.01,
+        ),
+    )
+    return fig
 
-    # ── Build albedo if missing ────────────────────────────────────────────────
-    if "albedo" not in ds and "influx_direct" in ds:
-        print("  ⚠  albedo missing — using constant 0.28 (Sahara desert average)")
-        ds["albedo"] = xr.DataArray(
-            np.full_like(ds["influx_direct"].values, 0.28, dtype="float32"),
-            dims=ds["influx_direct"].dims,
-            coords=ds["influx_direct"].coords,
-            attrs={"long_name": "surface albedo (constant approximation)", "units": "1"},
-        )
 
-    # STAGE 8: Set mandatory atlite metadata
-    # FIX 4: 'roughness' added to wind feature requirements so atlite
-    # marks 'wind' as a prepared feature. Without it, atlite silently
-    # skips wind even when wnd100m is present.
-    FEATURE_MAP = {
-        "influx":      ["influx_toa", "influx_direct", "influx_diffuse"],
-        "wind":        ["wnd100m", "roughness"],   # FIX 4: roughness required for log extrapolation
-        "temperature": ["temperature"],
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB 1 — LCOH MAP
+# ══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    METRIC_MAP = {
+        "LCOH (USD/kg H₂)":            ("lcoh_scaled",                  "LCOH USD/kg"),
+        "LCOH (DZD/kg H₂)":            ("lcoh_dzd_scaled",              "LCOH DZD/kg"),
+        "Solar Full Load Hours":        ("solar_full_load_hours",        "FLH/yr"),
+        "Wind CF Mean":                 ("wind_cf_mean",                 "Wind CF"),
+        "Renewable Share (%)":          ("pct_renewable",                "Renew. %"),
+        "Electrolyzer Utilization (%)": ("electrolyzer_utilization_pct", "Elec. util %"),
+        "Solar Capacity (kW)":          ("solar_capacity_kw",            "Solar kW"),
     }
-    prepared = [
-        feat for feat, needed in FEATURE_MAP.items()
-        if all(v in ds for v in needed)
-    ]
-    ds.attrs.update({
-        "module":            "era5",
-        "prepared_features": json.dumps(prepared),
-        "history":           f"Merged manually downloaded ERA5 files, year={year}",
-    })
+    col_name, col_label = METRIC_MAP[map_metric]
+    if col_name not in scaled_df.columns:
+        col_name, col_label = "lcoh_usd_per_kg", "LCOH USD/kg"
 
-    print(f"\n  -- Dataset summary --")
-    print(f"  Variables : {sorted(ds.data_vars)}")
-    print(f"  Time steps: {len(ds['time'])}")
-    print(f"  Lat range : {float(ds['y'].min()):.2f} - {float(ds['y'].max()):.2f}")
-    print(f"  Lon range : {float(ds['x'].min()):.2f} - {float(ds['x'].max()):.2f}")
-    print(f"  Features  : {prepared}\n")
+    fig = make_grid_map(scaled_df, col_name, col_label, colorscale,
+                        f"Algeria — {map_metric}", opacity=cell_opacity, height=640)
+    st.plotly_chart(fig, use_container_width=True)
 
-    # STAGE 9: Write to disk + load as atlite Cutout
-    print(f"  Writing {ATLITE_NC.name} ...", flush=True)
-    ds.to_netcdf(str(ATLITE_NC))
-    print(f"+ Saved ({ATLITE_NC.stat().st_size / 1e6:.0f} MB)")
-
-    cutout = atlite.Cutout(path=str(ATLITE_NC))
-    print(f"+ Cutout initialized - {len(cutout.coords['time'])} time steps")
-    return cutout
-
-
-# =============================================================================
-# 5. Extract capacity factors
-# =============================================================================
-def extract_cf_for_grid(
-    cutout,
-    cells:   pd.DataFrame,
-    panel:   str = "CSi",
-    turbine: str = "Vestas_V112_3MW",
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    import xarray as xr
-
-    cutout_lats = cutout.coords["y"].values
-    cutout_lons = cutout.coords["x"].values
-    n_times     = len(cutout.coords["time"].values)
-
-    print(f"\n  ERA5 grid: {len(cutout_lats)} lat x {len(cutout_lons)} lon, "
-          f"{n_times} time steps")
-    print(f"  Extracting CFs for {len(cells)} cells...")
-
-    solar_parts, wind_parts = [], []
-
-    for idx, row in cells.iterrows():
-        i_lat = int(np.argmin(np.abs(cutout_lats - row["lat"])))
-        i_lon = int(np.argmin(np.abs(cutout_lons - row["lon"])))
-
-        layout_pt = xr.DataArray(
-            np.zeros((len(cutout_lats), len(cutout_lons))),
-            coords={"y": cutout_lats, "x": cutout_lons},
-            dims=["y", "x"],
-        )
-        layout_pt.values[i_lat, i_lon] = 1.0
-
-        tilt = float(abs(row["lat"])) * 0.76
-        cf_solar = cutout.pv(
-            panel=panel,
-            orientation={"slope": tilt, "azimuth": 180.0},
-            layout=layout_pt,
-            per_unit=True,
-        )
-        solar_parts.append(cf_solar.values.ravel())
-
-        # FIX 5: Changed from "power" to "logarithmic".
-        # "power" law requires wnd_shear_exp, which atlite derives only when
-        # BOTH wnd10m and wnd100m are downloaded (needs u10/v10 + u100/v100).
-        # "logarithmic" law uses roughness (fsr), which we now keep in STAGE 7.
-        # To use power law in the future: add u10/v10 to your CDS download —
-        # atlite will then compute wnd_shear_exp automatically.
-        cf_wind = cutout.wind(
-            turbine=turbine,
-            interpolation_method="logarithmic",  # FIX 5: was "power"
-            layout=layout_pt,
-            per_unit=True,
-        )
-        wind_parts.append(cf_wind.values.ravel())
-
-        if (idx + 1) % 20 == 0 or (idx + 1) == len(cells):
-            pct = 100 * (idx + 1) / len(cells)
-            print(f"    [{idx + 1:3d}/{len(cells)}] {pct:.0f}%", flush=True)
-
-    solar_arr  = np.column_stack(solar_parts)
-    wind_arr   = np.column_stack(wind_parts)
-    timestamps = cutout.coords["time"].values
-
-    solar_df = pd.DataFrame(solar_arr, index=timestamps, columns=cells["cell_id"].values)
-    wind_df  = pd.DataFrame(wind_arr,  index=timestamps, columns=cells["cell_id"].values)
-    solar_df.index.name = "timestamp"
-    wind_df.index.name  = "timestamp"
-
-    return solar_df, wind_df
-
-
-# =============================================================================
-# 6. Statistics
-# =============================================================================
-def compute_stats(
-    cells:    pd.DataFrame,
-    solar_df: pd.DataFrame,
-    wind_df:  pd.DataFrame,
-) -> pd.DataFrame:
-    rows = []
-    for _, row in cells.iterrows():
-        cid = row["cell_id"]
-        scf = solar_df[cid]
-        wcf = wind_df[cid]
-        rows.append({
-            "cell_id":               cid,
-            "lat":                   row["lat"],
-            "lon":                   row["lon"],
-            "solar_cf_mean":         round(float(scf.mean()), 4),
-            "solar_full_load_hours": round(float(scf.sum()),  1),
-            "wind_cf_mean":          round(float(wcf.mean()), 4),
-            "wind_full_load_hours":  round(float(wcf.sum()),  1),
-        })
-    return pd.DataFrame(rows).set_index("cell_id")
-
-
-# =============================================================================
-# 7. Save outputs
-# =============================================================================
-def save_outputs(
-    cells:    pd.DataFrame,
-    solar_df: pd.DataFrame,
-    wind_df:  pd.DataFrame,
-    stats_df: pd.DataFrame,
-):
-    cells.to_csv(GRID_CELLS_PATH, index=False)
-    solar_df.to_csv(DATA_DIR / "solar_cf_grid.csv")
-    wind_df.to_csv( DATA_DIR / "wind_cf_grid.csv")
-    stats_df.to_csv(STATS_PATH)
-
-    print(f"\n+ Saved:")
-    print(f"  {GRID_CELLS_PATH}              ({len(cells)} cells)")
-    print(f"  {DATA_DIR / 'solar_cf_grid.csv'}  {solar_df.shape}")
-    print(f"  {DATA_DIR / 'wind_cf_grid.csv'}   {wind_df.shape}")
-    print(f"  {STATS_PATH}")
-
-    print("\nTop 10 cells by solar full-load hours:")
-    print(
-        stats_df
-        .sort_values("solar_full_load_hours", ascending=False)
-        [["lat", "lon", "solar_cf_mean", "solar_full_load_hours", "wind_cf_mean"]]
-        .head(10)
-        .to_string()
+    best5 = (
+        valid.nsmallest(5, "lcoh_scaled")
+        [["lat","lon","lcoh_scaled","lcoh_dzd_scaled","solar_full_load_hours","pct_renewable"]]
+        .round({"lcoh_scaled":3,"lcoh_dzd_scaled":0,"solar_full_load_hours":0,"pct_renewable":1})
     )
+    best5.columns = ["Lat","Lon","LCOH USD/kg","LCOH DZD/kg","Solar FLH","Renew. %"]
+    st.markdown("#### 🏆 Top 5 Lowest-LCOH Cells")
+    st.dataframe(best5, use_container_width=True, hide_index=True)
 
 
-# =============================================================================
-# Main
-# =============================================================================
-def run(year: int = 2024, resolution: float = 2.0, force: bool = False):
-    print("=" * 60)
-    print("  Algeria LCOH Grid - ERA5 Capacity Factor Extraction")
-    print("=" * 60)
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB 2 — SOLAR RESOURCE
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    if len(stats_df) > 0:
+        c_left, c_right = st.columns(2)
+        with c_left:
+            st.markdown("#### ☀️ Solar Full Load Hours")
+            st.plotly_chart(
+                make_grid_map(stats_df, "solar_full_load_hours", "FLH/yr",
+                              "YlOrRd", "Solar PV Full Load Hours (ERA5)",
+                              opacity=cell_opacity, height=420),
+                use_container_width=True)
+        with c_right:
+            st.markdown("#### 💨 Wind Capacity Factor")
+            st.plotly_chart(
+                make_grid_map(stats_df, "wind_cf_mean", "Wind CF",
+                              "Blues", "Wind CF — Vestas V112 3MW (ERA5)",
+                              opacity=cell_opacity, height=420),
+                use_container_width=True)
+    else:
+        st.info("Run atlite_grid.py first to generate resource maps.")
 
-    cells = build_grid_cells(resolution)
-    cells.to_csv(GRID_CELLS_PATH, index=False)
 
-    pairs = check_input_files()
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB 3 — STATISTICS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.markdown("#### LCOH Distribution")
+    fig_hist = go.Figure(go.Histogram(
+        x=valid["lcoh_scaled"], nbinsx=30,
+        marker=dict(color="#f5a623", line=dict(color="#070d1a", width=0.5)),
+        hovertemplate="LCOH: $%{x:.2f}/kg<br>Cells: %{y}<extra></extra>",
+    ))
+    fig_hist.add_vline(x=valid["lcoh_scaled"].mean(), line_dash="dot", line_color="#00d4b8",
+                       annotation_text=f"Mean: ${valid['lcoh_scaled'].mean():.2f}",
+                       annotation_font_color="#00d4b8")
+    fig_hist.update_layout(**PLOT_BG,
+        xaxis=dict(title="LCOH (USD/kg H₂)", gridcolor="#1e3050"),
+        yaxis=dict(title="Grid Cells", gridcolor="#1e3050"), height=320,
+        title=dict(text="LCOH Distribution Across Algeria", font=dict(color="#f5a623")))
+    st.plotly_chart(fig_hist, use_container_width=True)
 
-    cutout = merge_era5_files(pairs, year=year, force=force)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### LCOH vs Latitude")
+        fig_lat = go.Figure(go.Scatter(
+            x=valid["lat"], y=valid["lcoh_scaled"], mode="markers",
+            marker=dict(color=valid["lcoh_scaled"], colorscale="RdYlGn_r",
+                        size=8, line=dict(color="#070d1a", width=0.5), showscale=False),
+            hovertemplate="Lat: %{x:.1f}°N<br>LCOH: $%{y:.3f}/kg<extra></extra>"))
+        fig_lat.update_layout(**PLOT_BG, height=300,
+            xaxis=dict(title="Latitude (°N)", gridcolor="#1e3050"),
+            yaxis=dict(title="LCOH (USD/kg)", gridcolor="#1e3050"))
+        st.plotly_chart(fig_lat, use_container_width=True)
 
-    solar_df, wind_df = extract_cf_for_grid(cutout, cells)
+    with c2:
+        st.markdown("#### LCOH vs Solar FLH")
+        fig_flh = go.Figure(go.Scatter(
+            x=valid["solar_full_load_hours"], y=valid["lcoh_scaled"], mode="markers",
+            marker=dict(color=valid["lat"], colorscale="Viridis", size=8,
+                        line=dict(color="#070d1a", width=0.5),
+                        colorbar=dict(title="Lat", thickness=10,
+                                      tickfont=dict(color="#c8d8f0"))),
+            hovertemplate="FLH: %{x:.0f} h/yr<br>LCOH: $%{y:.3f}/kg<extra></extra>"))
+        fig_flh.update_layout(**PLOT_BG, height=300,
+            xaxis=dict(title="Solar Full Load Hours (h/yr)", gridcolor="#1e3050"),
+            yaxis=dict(title="LCOH (USD/kg)", gridcolor="#1e3050"))
+        st.plotly_chart(fig_flh, use_container_width=True)
 
-    stats_df = compute_stats(cells, solar_df, wind_df)
-
-    save_outputs(cells, solar_df, wind_df, stats_df)
-
-    print("\n  atlite_grid.py complete - run pypsa_grid.py next")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Merge downloaded ERA5 files and extract CFs for Algeria grid",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""
-        Required files in data/ folder:
-          era5_p1_accum.nc    era5_p1_instant.nc    (Jan-Apr)
-          era5_p2_accum.nc    era5_p2_instant.nc    (May-Aug)
-          era5_p3_accum.nc    era5_p3_instant.nc    (Sep-Dec)
-
-        Examples:
-          python atlite_grid.py
-          python atlite_grid.py --year 2024
-          python atlite_grid.py --force
-        """),
-    )
-    parser.add_argument("--year",       type=int,   default=2024)
-    parser.add_argument("--resolution", type=float, default=2.0)
-    parser.add_argument("--force",      action="store_true")
-    args = parser.parse_args()
-    run(year=args.year, resolution=args.resolution, force=args.force)
+    st.markdown("#### Full Grid Results")
+    display_cols = ["lat","lon","lcoh_scaled","lcoh_dzd_scaled",
+                    "solar_full_load_hours","wind_cf_mean",
+                    "pct_renewable","solar_capacity_kw","electrolyzer_capacity_kw"]
+    display_cols = [c for c in display_cols if c in valid.columns]
+    rename = {"lcoh_scaled":"LCOH USD/kg","lcoh_dzd_scaled":"LCOH DZD/kg",
+              "solar_full_load_hours":"Solar FLH","wind_cf_mean":"Wind CF",
+              "pct_renewable":"Renew. %","solar_capacity_kw":"Solar kW",
+              "electrolyzer_capacity_kw":"Elec. kW"}
+    tbl = valid[display_cols].rename(columns=rename).sort_values("LCOH USD/kg")
+    st.dataframe(tbl.round(3), use_container_width=True, hide_index=True)
