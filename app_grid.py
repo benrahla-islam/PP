@@ -163,7 +163,7 @@ with st.sidebar:
         st.markdown("""<div class='warn-box'>
             ⚠️ No precomputed grid found.<br>
             Run first:<br>
-            <code>python atlite_grid.py --key YOUR_KEY</code><br>
+            <code>python atlite_grid.py</code><br>
             <code>python pypsa_grid.py</code>
         </div>""", unsafe_allow_html=True)
 
@@ -208,12 +208,13 @@ with st.sidebar:
 
     # ── Export ────────────────────────────────────────────────────────────────
     st.markdown("<div class='section-title'>📥 Export</div>", unsafe_allow_html=True)
-    if has_data and st.button("⬇️ Download CSV", width="stretch"):
+    if has_data:
         st.download_button(
-            "Download lcoh_grid.csv",
+            "⬇️ Download lcoh_grid.csv",
             data=grid_df.to_csv(index=False),
             file_name="algeria_lcoh_grid.csv",
             mime="text/csv",
+            width="stretch",
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -243,7 +244,7 @@ if not has_data:
     with c2:
         st.markdown("""<div class='info-box'>
         <b>Step 2 — Download ERA5 + extract CFs</b><br><br>
-        <code>python atlite_grid.py --key YOUR_KEY</code><br><br>
+        <code>python atlite_grid.py</code><br><br>
         Downloads ~2-4 GB. Takes 10-30 min.<br>
         Only needed once.
         </div>""", unsafe_allow_html=True)
@@ -326,7 +327,7 @@ with tab1:
         lon=plot_df["lon"],
         mode="markers",
         marker=dict(
-            size=22,
+            size=24 if show_grid_lines else 20,
             color=z_vals,
             colorscale=colorscale,
             colorbar=dict(
@@ -337,7 +338,6 @@ with tab1:
                 thickness=14,
             ),
             opacity=0.85,
-            symbol="square",
         ),
         text=[
             f"<b>Cell {row['cell_id']}</b><br>"
@@ -397,7 +397,7 @@ with tab2:
                 lat=stats_df["lat"], lon=stats_df["lon"],
                 mode="markers",
                 marker=dict(
-                    size=20, symbol="square",
+                    size=20,
                     color=stats_df[flh_col],
                     colorscale="YlOrRd",
                     colorbar=dict(title="FLH/yr", tickfont=dict(color="#c8d8f0"),
@@ -422,7 +422,7 @@ with tab2:
                 lat=stats_df["lat"], lon=stats_df["lon"],
                 mode="markers",
                 marker=dict(
-                    size=20, symbol="square",
+                    size=20,
                     color=stats_df[wcf_col],
                     colorscale="Blues",
                     colorbar=dict(title="Wind CF", tickfont=dict(color="#c8d8f0"),

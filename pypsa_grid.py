@@ -135,7 +135,7 @@ def solve_all_cells(
             status = solve_network(net, solver_name=solver)
 
             if status == "optimal":
-                res = extract_results(net, params, solar_cf)
+                res = extract_results(net, params, wind_cf)
                 record = res.to_dict()
             else:
                 record = {"status": status, "lcoh_usd_per_kg": np.nan}
@@ -217,7 +217,7 @@ def run(
     print_summary(df)
     print(f"\n  Total time: {elapsed/60:.1f} min")
     print(f"  Saved to  : {OUTPUT_PATH}")
-    print(f"\n✅ Precomputation complete — run app.py next")
+    print(f"\n✅ Precomputation complete — run app_grid.py next")
 
 
 if __name__ == "__main__":
